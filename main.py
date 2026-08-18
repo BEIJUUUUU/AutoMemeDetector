@@ -719,6 +719,9 @@ class MainWindow(QMainWindow):
         # 初始化pygame mixer
         pygame.mixer.init()
         
+        # 播放互斥锁：同一时刻只允许一路音频在播，防止关键词叠播
+        self.audio_lock = threading.Lock()
+        
         self.cm = ConfigManager()
         self.init_ui()
         
@@ -959,6 +962,11 @@ class MainWindow(QMainWindow):
         self.update_btn_style(is_running)
 
     def play_audio(self, path):
+        # 播放互斥锁：正在播放时直接忽略新的触发，防止同一关键词叠播
+        if not self.audio_lock.acquire(blocking=False):
+            self.update_log("正在播放中，忽略本次触发")
+            return
+
         # 使用线程播放音频，避免IO阻塞UI
         def _play_thread():
             try:
@@ -985,12 +993,12 @@ class MainWindow(QMainWindow):
                 if channel:
                     while channel.get_busy():
                         time.sleep(0.1)
-                
-                # 播放完成，解除保护
-                self.speaker_worker.set_playing_state(False)
             except Exception as e:
-                self.speaker_worker.set_playing_state(False)
                 pass # print(f"播放失败: {e}")
+            finally:
+                # 播放完成：解除扬声器递归保护并释放播放锁
+                self.speaker_worker.set_playing_state(False)
+                self.audio_lock.release()
         
         threading.Thread(target=_play_thread, daemon=True).start()
 
