@@ -76,6 +76,7 @@ class ConfigManager:
     def load_settings(self):
         default = {
             "volume": 70,
+            "cooldown_seconds": 2.0,  # 播放结束后的冷却时间（秒），冷却期内不再触发
             "input_device": None,
             "output_device": None,  # 扬声器设备
             "hotkey": "alt+m",
@@ -721,6 +722,8 @@ class MainWindow(QMainWindow):
         
         # 播放互斥锁：同一时刻只允许一路音频在播，防止关键词叠播
         self.audio_lock = threading.Lock()
+        # 上次播放结束的时间戳，用于冷却时间计算（初始设为很久以前，避免刚启动就误判冷却）
+        self.last_play_end_time = 0.0
         
         self.cm = ConfigManager()
         self.init_ui()
@@ -806,6 +809,19 @@ class MainWindow(QMainWindow):
         self.slider.valueChanged.connect(self.on_volume_change)
         vol_box.addWidget(self.slider)
         g_layout.addLayout(vol_box)
+
+        # 冷却时间（秒）：播放结束后的静默期，期间不再触发
+        cd_box = QHBoxLayout()
+        cd_box.addWidget(QLabel("冷却时间:"))
+        self.slider_cooldown = QSlider(Qt.Horizontal)
+        self.slider_cooldown.setRange(0, 30)  # 0-30 秒，0 = 关闭冷却
+        self.slider_cooldown.setValue(self.get_cooldown_seconds(int_only=True))
+        self.slider_cooldown.valueChanged.connect(self.on_cooldown_change)
+        cd_box.addWidget(self.slider_cooldown)
+        self.label_cooldown = QLabel(f"{int(self.slider_cooldown.value())} 秒")
+        self.label_cooldown.setMinimumWidth(48)
+        cd_box.addWidget(self.label_cooldown)
+        g_layout.addLayout(cd_box)
 
         # 输入设备（麦克风）
         dev_box = QHBoxLayout()
@@ -961,7 +977,25 @@ class MainWindow(QMainWindow):
                  pass 
         self.update_btn_style(is_running)
 
+    def get_cooldown_seconds(self, int_only=False):
+        """安全读取冷却秒数：配置损坏/非法值一律回退到默认值，避免启动崩溃"""
+        default = 2.0
+        try:
+            val = float(self.cm.settings.get('cooldown_seconds', default))
+        except (TypeError, ValueError):
+            val = default
+        if val < 0:
+            val = 0.0
+        if val > 30:
+            val = 30.0
+        return int(val) if int_only else val
+
     def play_audio(self, path):
+        # 冷却保护：播放结束后的冷却期内不再触发
+        cooldown = self.get_cooldown_seconds()
+        if cooldown > 0 and (time.time() - self.last_play_end_time) < cooldown:
+            return
+
         # 播放互斥锁：正在播放时直接忽略新的触发，防止同一关键词叠播
         if not self.audio_lock.acquire(blocking=False):
             self.update_log("正在播放中，忽略本次触发")
@@ -996,7 +1030,8 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 pass # print(f"播放失败: {e}")
             finally:
-                # 播放完成：解除扬声器递归保护并释放播放锁
+                # 播放完成：记录冷却起点，解除扬声器递归保护并释放播放锁
+                self.last_play_end_time = time.time()
                 self.speaker_worker.set_playing_state(False)
                 self.audio_lock.release()
         
@@ -1036,6 +1071,11 @@ class MainWindow(QMainWindow):
     def on_volume_change(self, val):
         self.cm.settings['volume'] = val
         self.cm.save_settings()
+
+    def on_cooldown_change(self, val):
+        self.cm.settings['cooldown_seconds'] = float(val)
+        self.cm.save_settings()
+        self.label_cooldown.setText(f"{val} 秒")
 
     def on_gpu_change(self, state):
         enabled = (state == Qt.Checked)
